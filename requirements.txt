@@ -1,8 +1,11 @@
 streamlit
+numpy
+opencv-python-headless
+tensorflow-cpu
+onnxruntime
 oemer
 music21
 midi2audio
 pydub
 pdf2image
-opencv-python-headless
-tensorflow-cpu
+requests
