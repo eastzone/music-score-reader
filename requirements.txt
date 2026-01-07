@@ -1,0 +1,8 @@
+streamlit
+oemer
+music21
+midi2audio
+pydub
+pdf2image
+opencv-python-headless
+tensorflow-cpu
