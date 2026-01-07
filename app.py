@@ -178,7 +178,7 @@ if uploaded_file:
     os.makedirs(temp_dir, exist_ok=True)
 
     # Show Preview
-    st.image(uploaded_file, caption="Preview", width=None) # width=None respects deprecation warning (auto width)
+    st.image(uploaded_file, caption="Preview", width="stretch")
 
     if st.button("▶️ Generate Audio"):
         status = st.status("Starting AI Engine...", expanded=True)
