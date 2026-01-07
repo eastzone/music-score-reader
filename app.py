@@ -3,175 +3,211 @@ import os
 import shutil
 import sys
 import importlib.util
+import requests
 from pathlib import Path
 from pdf2image import convert_from_path
 from music21 import converter
 from midi2audio import FluidSynth
 from pydub import AudioSegment
-import requests
+from PIL import Image
 
 # --- CONFIGURATION ---
+# Uses a lightweight SoundFont to save bandwidth
 SOUNDFONT_URL = "https://raw.githubusercontent.com/musescore/MuseScore/master/share/sound/FluidR3Mono_GM.sf3"
 SOUNDFONT_FILE = "FluidR3Mono_GM.sf3"
 
-# --- SYSTEM FIXES ---
+# --- SYSTEM SETUP & PATCHING ---
 def download_soundfont():
-    """Downloads a smaller soundfont to bypass GitHub 100MB limits."""
     if not os.path.exists(SOUNDFONT_FILE):
-        with st.spinner(f"Downloading SoundFont (one-time setup)..."):
-            response = requests.get(SOUNDFONT_URL)
-            with open(SOUNDFONT_FILE, "wb") as f:
-                f.write(response.content)
+        with st.spinner("Downloading SoundFont (one-time setup)..."):
+            try:
+                response = requests.get(SOUNDFONT_URL, timeout=30)
+                response.raise_for_status()
+                with open(SOUNDFONT_FILE, "wb") as f:
+                    f.write(response.content)
+            except Exception as e:
+                st.error(f"Failed to download SoundFont: {e}")
+                st.stop()
 
-def setup_oemer():
+def setup_oemer_patch():
     """
-    Fixes PermissionError on Streamlit Cloud.
-    Copies oemer to the local writable folder so it can download its own checkpoints.
+    CRITICAL FIX: Streamlit Cloud is read-only. 'oemer' tries to download models 
+    to its install folder and fails. We copy 'oemer' to a local writable folder 
+    and force Python to use that copy.
     """
-    # 1. Check if we already have a local copy
-    if os.path.exists("oemer_local"):
-        # Add local folder to path so Python imports this one instead of the system one
-        if os.path.abspath("oemer_local") not in sys.path:
-            sys.path.insert(0, os.path.abspath("oemer_local"))
+    local_oemer_dir = "oemer_local"
+    
+    # Check if already patched in this session
+    if os.path.abspath(local_oemer_dir) in sys.path:
         return
 
-    with st.spinner("Setting up AI models (first time only)..."):
-        # 2. Find where oemer is installed in the system
+    # If the folder exists from a previous run, use it
+    if os.path.exists(local_oemer_dir) and os.path.exists(os.path.join(local_oemer_dir, "oemer")):
+        sys.path.insert(0, os.path.abspath(local_oemer_dir))
+        return
+
+    with st.spinner("Initializing AI Engine (this takes 30s the first time)..."):
+        # Find where oemer is installed in the system
         spec = importlib.util.find_spec("oemer")
         if spec is None:
-            st.error("oemer is not installed in the environment!")
+            st.error("❌ Critical: 'oemer' library not found. Check requirements.txt.")
             st.stop()
         
         system_oemer_path = os.path.dirname(spec.origin)
+        target_path = os.path.join(local_oemer_dir, "oemer")
         
-        # 3. Copy it to a local folder named 'oemer_local/oemer'
-        # We nest it so we can add 'oemer_local' to sys.path and import 'oemer' cleanly
-        os.makedirs("oemer_local", exist_ok=True)
-        target_path = os.path.join("oemer_local", "oemer")
+        # Copy system oemer to local writable directory
+        # dirs_exist_ok=True prevents crashes if folder exists partially
+        shutil.copytree(system_oemer_path, target_path, dirs_exist_ok=True)
         
-        if not os.path.exists(target_path):
-            shutil.copytree(system_oemer_path, target_path)
-        
-        # 4. Insert into sys.path to ensure we use this writable version
-        sys.path.insert(0, os.path.abspath("oemer_local"))
+        # Insert local path to the TOP of sys.path so imports find this version first
+        sys.path.insert(0, os.path.abspath(local_oemer_dir))
 
-# --- BACKEND LOGIC ---
-class MusicOCRConverter:
+# --- CORE PROCESSING ---
+class MusicConverter:
     def __init__(self):
         download_soundfont()
-        setup_oemer() # Run the permission fix
-        self.soundfont_path = SOUNDFONT_FILE
+        setup_oemer_patch()
+        self.soundfont = SOUNDFONT_FILE
 
-    def convert_pdf_to_img(self, pdf_bytes, temp_dir):
-        pdf_path = os.path.join(temp_dir, "input.pdf")
-        with open(pdf_path, "wb") as f:
-            f.write(pdf_bytes)
-        images = convert_from_path(pdf_path, first_page=1, last_page=1)
-        img_path = os.path.join(temp_dir, "score.png")
-        images[0].save(img_path, 'PNG')
-        return img_path
+    def prepare_image(self, file_bytes, file_name, temp_dir):
+        """Converts PDF/Image to a standardized RGB PNG."""
+        output_path = os.path.join(temp_dir, "input_score.png")
+        
+        if file_name.lower().endswith(".pdf"):
+            # PDF Processing
+            temp_pdf = os.path.join(temp_dir, "temp.pdf")
+            with open(temp_pdf, "wb") as f:
+                f.write(file_bytes)
+            # Convert 1st page only, at 300 DPI for better OCR
+            images = convert_from_path(temp_pdf, first_page=1, last_page=1, dpi=300)
+            img = images[0]
+        else:
+            # Image Processing
+            temp_img = os.path.join(temp_dir, "temp_input")
+            with open(temp_img, "wb") as f:
+                f.write(file_bytes)
+            img = Image.open(temp_img)
 
-    def save_uploaded_image(self, img_bytes, temp_dir):
-        img_path = os.path.join(temp_dir, "score.png")
-        with open(img_path, "wb") as f:
-            f.write(img_bytes)
-        return img_path
+        # CRITICAL: Convert to RGB. oemer fails on 'RGBA' (transparent) images.
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        img.save(output_path, "PNG")
+        return output_path
 
     def run_omr(self, image_path):
-        """Runs oemer using the Python API directly (bypassing CLI issues)."""
-        
-        # IMPORT OEMER HERE (After setup_oemer ensures it's loading the local writable version)
-        import oemer.ete as oemer_ete
-        
-        # oemer expects the file to be in the working directory for best results
-        # We will copy the image to the current root to be safe
-        local_img = "temp_omr_input.png"
-        shutil.copy(image_path, local_img)
-        
-        print("Running OMR extraction...")
-        # We call the main extraction function directly
-        # 'use_tf' is False to ensure we use Onnx (lighter)
+        """Runs oemer by mocking command line arguments."""
+        # Import inside function to ensure we use the PATCHED version from setup_oemer_patch()
         try:
-            # We mock the arguments oemer expects
-            class Args:
-                img_path = local_img
-                use_tf = False
-                save_path = "./" # Save to current writable dir
-            
-            # Run extraction
-            # This triggers the model download, which will now work because 
-            # we are running from the writable 'oemer_local' folder
-            oemer_ete.main(Args())
-            
-            # Identify output file
-            # oemer usually outputs: [filename].musicxml
-            expected_output = local_img + ".musicxml"
-            
-            if os.path.exists(expected_output):
-                return expected_output
-            
-            # Fallback check
-            base_name = os.path.splitext(local_img)[0]
-            if os.path.exists(base_name + ".musicxml"):
-                return base_name + ".musicxml"
-                
-            raise FileNotFoundError("MusicXML file was not generated.")
-            
+            import oemer.ete as oemer_ete
+        except ImportError:
+            # Fallback if patch failed
+            import oemer.ete as oemer_ete
+
+        print(f"🎵 Analyzying score: {image_path}")
+
+        # Hack: Modify sys.argv to trick oemer into thinking it was called from CLI
+        # This bypasses the need to understand oemer's internal API changes
+        original_argv = sys.argv
+        sys.argv = ["oemer", image_path]
+
+        try:
+            # This will trigger model download (if needed) into our writable folder
+            oemer_ete.main()
+        except SystemExit as e:
+            # oemer calls sys.exit(0) on success, which would kill our server. We catch it.
+            if e.code != 0:
+                raise RuntimeError(f"OMR Engine exited with error code {e.code}")
+        except Exception as e:
+            raise RuntimeError(f"OMR Engine crashed: {str(e)}")
         finally:
-            # Cleanup the temp image in root
-            if os.path.exists(local_img):
-                os.remove(local_img)
+            sys.argv = original_argv  # Restore system state
 
-    def xml_to_midi(self, xml_path):
-        s = converter.parse(xml_path)
+        # Check for output. oemer usually appends .musicxml
+        expected_output = image_path + ".musicxml"
+        if os.path.exists(expected_output):
+            return expected_output
+        
+        # Fallback: sometimes it names it without extension
+        no_ext_path = os.path.splitext(image_path)[0] + ".musicxml"
+        if os.path.exists(no_ext_path):
+            return no_ext_path
+            
+        raise FileNotFoundError("AI finished but generated no MusicXML file. The image might be too complex or blurry.")
+
+    def generate_audio(self, xml_path):
+        """Converts MusicXML -> MIDI -> WAV -> MP3"""
         midi_path = xml_path.replace(".musicxml", ".mid")
-        s.write('midi', fp=midi_path)
-        return midi_path
+        wav_path = xml_path.replace(".musicxml", ".wav")
+        mp3_path = xml_path.replace(".musicxml", ".mp3")
 
-    def midi_to_mp3(self, midi_path):
-        wav_path = midi_path.replace(".mid", ".wav")
-        mp3_path = midi_path.replace(".mid", ".mp3")
-        fs = FluidSynth(self.soundfont_path)
+        # 1. XML -> MIDI
+        try:
+            score = converter.parse(xml_path)
+            score.write('midi', fp=midi_path)
+        except Exception as e:
+            raise ValueError(f"Failed to parse music notation: {e}")
+
+        # 2. MIDI -> WAV (FluidSynth)
+        if not os.path.exists(self.soundfont):
+            raise FileNotFoundError(f"SoundFont file missing: {self.soundfont}")
+            
+        fs = FluidSynth(self.soundfont)
         fs.midi_to_audio(midi_path, wav_path)
-        audio = AudioSegment.from_wav(wav_path)
-        audio.export(mp3_path, format="mp3")
+
+        # 3. WAV -> MP3 (pydub)
+        # Using a lower bitrate (128k) to process faster on cloud
+        AudioSegment.from_wav(wav_path).export(mp3_path, format="mp3", bitrate="128k")
+        
         return mp3_path
 
-# --- FRONTEND ---
-st.set_page_config(page_title="AI Music Score Player", page_icon="🎵")
-st.title("🎵 AI Sheet Music Player")
-st.write("Upload a PDF or Image of a music score.")
+# --- UI LOGIC ---
+st.set_page_config(page_title="Sheet Music to MP3", page_icon="🎼", layout="centered")
 
-uploaded_file = st.file_uploader("Choose a music score", type=["pdf", "png", "jpg"])
+st.title("🎼 Sheet Music to Audio")
+st.markdown("Upload a **PDF** or **Image** of sheet music. The AI will read the notes and play them back.")
 
-if uploaded_file is not None:
-    temp_dir = "temp_processing"
+uploaded_file = st.file_uploader("Upload Score", type=["pdf", "png", "jpg", "jpeg"])
+
+if uploaded_file:
+    # Use a temp dir that cleans up after itself
+    temp_dir = "temp_workspace"
+    if os.path.exists(temp_dir):
+        shutil.rmtree(temp_dir)
     os.makedirs(temp_dir, exist_ok=True)
-    st.image(uploaded_file, caption="Uploaded Score", use_container_width=True)
-    
-    if st.button("▶️ Convert to Audio"):
+
+    # Show Preview
+    st.image(uploaded_file, caption="Preview", width=None) # width=None respects deprecation warning (auto width)
+
+    if st.button("▶️ Generate Audio"):
+        status = st.status("Starting AI Engine...", expanded=True)
+        
         try:
-            converter = MusicOCRConverter()
-            with st.spinner("Processing... (This takes 1-2 mins initially)"):
-                if uploaded_file.name.endswith(".pdf"):
-                    img_path = converter.convert_pdf_to_img(uploaded_file.getvalue(), temp_dir)
-                else:
-                    img_path = converter.save_uploaded_image(uploaded_file.getvalue(), temp_dir)
-                
-                # Run the pipeline
-                xml_path = converter.run_omr(img_path)
-                midi_path = converter.xml_to_midi(xml_path)
-                mp3_path = converter.midi_to_mp3(midi_path)
-                
-            st.success("Conversion Complete!")
-            st.subheader("🎧 Listen")
-            with open(mp3_path, "rb") as audio_file:
-                st.audio(audio_file.read(), format="audio/mp3")
+            converter = MusicConverter()
+            
+            status.write("🖼️ Processing Image...")
+            img_path = converter.prepare_image(uploaded_file.getvalue(), uploaded_file.name, temp_dir)
+            
+            status.write("🎼 Reading Notes (OMR)...")
+            xml_path = converter.run_omr(img_path)
+            
+            status.write("🎹 Synthesizing Audio...")
+            mp3_path = converter.generate_audio(xml_path)
+            
+            status.update(label="✅ Done!", state="complete", expanded=False)
+            
+            # Result
+            st.success("Conversion Successful!")
+            
+            # Audio Player
+            with open(mp3_path, "rb") as f:
+                audio_bytes = f.read()
+                st.audio(audio_bytes, format="audio/mp3")
+                st.download_button("Download MP3", audio_bytes, "music.mp3", "audio/mp3")
+
         except Exception as e:
-            st.error(f"Error: {e}")
-            # Print detailed error to logs for debugging
-            import traceback
-            traceback.print_exc()
-        finally:
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
+            status.update(label="❌ Error", state="error")
+            st.error(f"An error occurred: {str(e)}")
+            # Debugging info (optional, helps if you see logs)
+            print(e)
